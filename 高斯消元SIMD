@@ -1,0 +1,498 @@
+#include <iostream>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <windows.h>
+#include <cmath>
+#include <stdexcept>
+#include <algorithm>
+#include <xmmintrin.h>
+#include <immintrin.h>
+
+using namespace std;
+
+//全局设置 
+const int BLOCK_SIZE =128;  // Cache分块大小
+const int CACHE_LINE = 16;  // 缓存行大小（16*4B=64B）
+// 测试规模列表（验证不同规模的稳健性）
+const int TEST_SIZES[] = {5,100, 300, 600, 1000, 1500, 2000,3000,4000};
+const int TEST_COUNT = sizeof(TEST_SIZES)/sizeof(int);
+// 手动指定指令集（避免__cpuid检测，默认用SSE，兼容性） 
+const bool USE_AVX2 = false; 
+
+// 高精度计时
+double get_high_res_time() {
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    return (double)t.QuadPart / f.QuadPart;
+}
+
+//生成测试数据
+void generate_test_data(int n, float* A, float* B) {
+    srand(123323); // 固定种子
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            A[i * n + j] = (float)(rand() % 100) / 10.0f;
+        }
+        A[i * n + i] += 100.0f; // 对角线占优，避免消元出错
+        B[i] = (float)(rand() % 50) / 10.0f;
+    }
+}
+
+// ========== 1. 原始串行高斯消元（你的基础版本） ==========
+float* gauss_serial_baseline(int n, float* A, float* B) {
+    try {
+        int row, col, pivot_row;
+        float max_val, factor, temp;
+
+        for (col = 0; col < n; col++) {
+            // 选主元（行主元，避免除0）
+            pivot_row = col;
+            max_val = fabsf(A[pivot_row * n + col]);
+            for (row = col+1; row < n; row++) {
+                if (fabsf(A[row * n + col]) > max_val) {
+                    max_val = fabsf(A[row * n + col]);
+                    pivot_row = row;
+                }
+            }
+
+            //  交换主元行（矩阵+向量）
+            if (pivot_row != col) {
+                for (int j = col; j < n; j++) {
+                    temp = A[col * n + j];
+                    A[col * n + j] = A[pivot_row * n + j];
+                    A[pivot_row * n + j] = temp;
+                }
+                temp = B[col];
+                B[col] = B[pivot_row];
+                B[pivot_row] = temp;
+            }
+
+            // 串行消元
+            for (row = col+1; row < n; row++) {
+                factor = A[row * n + col] / A[col * n + col];
+                for (int j = col; j < n; j++) {
+                    A[row * n + j] -= factor * A[col * n + j];
+                }
+                B[row] -= factor * B[col];
+            }
+        }
+
+        // 回代求解
+        float* x = new float[n];
+        for (row = n-1; row >= 0; row--) {
+            x[row] = B[row];
+            for (col = row+1; col < n; col++) {
+                x[row] -= A[row * n + col] * x[col];
+            }
+            x[row] /= A[row * n + row];
+        }
+        return x;
+    } catch (const exception& e) {
+        cerr << "串行基准版本异常：" << e.what() << endl;
+        return nullptr;
+    }
+}
+
+// ========== 2. 优化后的串行高斯消元 ==========
+float* gauss_serial_optimized(int n, float* A, float* B) {
+    try {
+        int row, col, pivot_row;
+        float max_val, factor, temp;
+
+        for (col = 0; col < n; col++) {
+            // 优化1：选主元提前终止（奇异矩阵直接退出）
+            pivot_row = col;
+            max_val = fabsf(A[pivot_row * n + col]);
+            if (max_val < 1e-6) break; // 奇异矩阵，终止计算
+            
+            for (row = col+1; row < n; row++) {
+                float curr_val = fabsf(A[row * n + col]);
+                if (curr_val > max_val) {
+                    max_val = curr_val;
+                    pivot_row = row;
+                }
+            }
+
+            // 优化2：按缓存行交换行，提升内存局部性
+            if (pivot_row != col) {
+                for (int j = col; j < n; j += CACHE_LINE) {
+                    int end_j = min(j + CACHE_LINE, n);
+                    for (int k = j; k < end_j; k++) {
+                        temp = A[col * n + k];
+                        A[col * n + k] = A[pivot_row * n + k];
+                        A[pivot_row * n + k] = temp;
+                    }
+                }
+                temp = B[col];
+                B[col] = B[pivot_row];
+                B[pivot_row] = temp;
+            }
+
+            // 优化3：提前缓存主元值，减少重复访问
+            float pivot_val = A[col * n + col];
+            for (row = col+1; row < n; row++) {
+                factor = A[row * n + col] / pivot_val;
+                A[row * n + col] = 0.0f; // 显式置0，减少后续计算
+                
+                // 按缓存行消去，提升Cache命中率
+                for (int j = col+1; j < n; j += CACHE_LINE) {
+                    int end_j = min(j + CACHE_LINE, n);
+                    for (int k = j; k < end_j; k++) {
+                        A[row * n + k] -= factor * A[col * n + k];
+                    }
+                }
+                B[row] -= factor * B[col];
+            }
+        }
+
+        // 优化4：回代阶段按缓存行累加
+        float* x = new float[n];
+        for (row = n-1; row >= 0; row--) {
+            float sum = 0.0f;
+            for (col = row+1; col < n; col += CACHE_LINE) {
+                int end_col = min(col + CACHE_LINE, n);
+                for (int k = col; k < end_col; k++) {
+                    sum += A[row * n + k] * x[k];
+                }
+            }
+            x[row] = (B[row] - sum) / A[row * n + row];
+        }
+        return x;
+    } catch (const exception& e) {
+        cerr << "串行优化版本异常：" << e.what() << endl;
+        return nullptr;
+    }
+}
+
+// ========== 3. 原始SIMD高斯消元（你的基础版本） ==========
+float* gauss_simd_baseline(int n, float* A, float* B) {
+    try {
+        // 小矩阵（<300阶）直接用串行，避免SIMD开销
+        if (n < 300) {
+            return gauss_serial_baseline(n, A, B);
+        }
+
+        int row, col, pivot_row, b_row, b_col;
+        float max_val, factor, temp;
+
+        // 分块消元核心（Cache友好，提升大矩阵稳健性）
+        for (b_col = 0; b_col < n; b_col += BLOCK_SIZE) {
+            int col_end = min(b_col + BLOCK_SIZE, n);
+            // 常规主元选择+行交换
+            for (col = b_col; col < col_end; col++) {
+                // 选主元
+                pivot_row = col;
+                max_val = fabsf(A[pivot_row * n + col]);
+                for (row = col+1; row < n; row++) {
+                    if (fabsf(A[row * n + col]) > max_val) {
+                        max_val = fabsf(A[row * n + col]);
+                        pivot_row = row;
+                    }
+                }
+
+                // 交换行
+                if (pivot_row != col) {
+                    for (int j = col; j < n; j++) {
+                        temp = A[col * n + j];
+                        A[col * n + j] = A[pivot_row * n + j];
+                        A[pivot_row * n + j] = temp;
+                    }
+                    temp = B[col];
+                    B[col] = B[pivot_row];
+                    B[pivot_row] = temp;
+                }
+
+                // 分块内消元（减少Cache未命中）
+                for (b_row = col+1; b_row < n; b_row += BLOCK_SIZE) {
+                    int row_end = min(b_row + BLOCK_SIZE, n);
+                    for (row = b_row; row < row_end; row++) {
+                        factor = A[row * n + col] / A[col * n + col];
+                        
+                        // 自适应SIMD（手动指定SSE/AVX2，避免CPU检测）
+                        int j = col;
+                        if (USE_AVX2) {
+                            // AVX2：一次8个元素（未对齐加载，兼容所有内存）
+                            for (; j + 7 < n; j += 8) {
+                                __m256 V_pivot = _mm256_loadu_ps(&A[col * n + j]);
+                                __m256 V_row = _mm256_loadu_ps(&A[row * n + j]);
+                                __m256 V_factor = _mm256_set1_ps(factor);
+                                V_row = _mm256_sub_ps(V_row, _mm256_mul_ps(V_factor, V_pivot));
+                                _mm256_storeu_ps(&A[row * n + j], V_row);
+                            }
+                        } else {
+                            // SSE：一次4个元素（默认，兼容性100%）
+                            for (; j + 3 < n; j += 4) {
+                                __m128 V_pivot = _mm_loadu_ps(&A[col * n + j]);
+                                __m128 V_row = _mm_loadu_ps(&A[row * n + j]);
+                                __m128 V_factor = _mm_set1_ps(factor);
+                                V_row = _mm_sub_ps(V_row, _mm_mul_ps(V_factor, V_pivot));
+                                _mm_storeu_ps(&A[row * n + j], V_row);
+                            }
+                        }
+
+                        // 处理剩余元素（不足4/8个）
+                        for (; j < n; j++) {
+                            A[row * n + j] -= factor * A[col * n + j];
+                        }
+                        B[row] -= factor * B[col];
+                    }
+                }
+            }
+        }
+
+        // 回代求解（和串行一致）
+        float* x = new float[n];
+        for (row = n-1; row >= 0; row--) {
+            x[row] = B[row];
+            for (col = row+1; col < n; col++) {
+                x[row] -= A[row * n + col] * x[col];
+            }
+            x[row] /= A[row * n + row];
+        }
+        return x;
+    } catch (const exception& e) {
+        cerr << "SIMD基准版本异常：" << e.what() << endl;
+        return nullptr;
+    }
+}
+
+// ========== 4. 优化后的SIMD高斯消元 ==========
+// 辅助函数：动态获取CPU L1 Cache大小（适配分块）
+// 辅助函数：动态获取CPU L1 Cache大小（适配分块）【修复编译错误版】
+int get_L1_cache_size() {
+    DWORD buffer_size = 0;
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION* buffer = nullptr;
+    // 第一次调用：传NULL获取所需buffer_size
+    if (!GetLogicalProcessorInformation(NULL, &buffer_size)) {
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+            // 分配内存（按所需大小）
+            buffer = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION*)malloc(buffer_size);
+            // 第二次调用：传入分配好的buffer
+            if (GetLogicalProcessorInformation(buffer, &buffer_size)) {
+                // 遍历获取L1 Cache大小
+                for (DWORD i = 0; i < buffer_size / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION); i++) {
+                    
+                    if ((buffer[i].Relationship == RelationCache) && (buffer[i].Cache.Level == 1)) {
+                        buffer_size = buffer[i].Cache.Size; // 暂存L1大小
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    
+    int L1_size = buffer_size > 0 ? (int)sqrt((double)buffer_size / 4) & ~0x3F : BLOCK_SIZE;
+    
+    if (buffer) free(buffer); // 释放内存
+    return L1_size > 0 ? L1_size : BLOCK_SIZE; // 兜底用默认BLOCK_SIZE
+}
+
+float* gauss_simd_optimized(int n, float* A, float* B) {
+    try {
+        // 优化1：动态调整小矩阵阈值（适配CPU核心数）
+        SYSTEM_INFO sys_info;
+        GetSystemInfo(&sys_info);
+        int cpu_cores = sys_info.dwNumberOfProcessors;
+        int small_matrix_thresh = (cpu_cores >= 4) ? 200 : 300;
+        if (n < small_matrix_thresh) {
+            return gauss_serial_optimized(n, A, B);
+        }
+
+        int row, col, pivot_row, b_row, b_col;
+        float max_val, factor, temp;
+        int DYNAMIC_BLOCK_SIZE = get_L1_cache_size(); // 优化2：动态分块
+        const int CACHE_LINE = 16;
+
+        // 优化3：提前计算分块数，减少冗余判断
+        int col_block_num = (n + DYNAMIC_BLOCK_SIZE - 1) / DYNAMIC_BLOCK_SIZE;
+        int row_block_num = (n + DYNAMIC_BLOCK_SIZE - 1) / DYNAMIC_BLOCK_SIZE;
+
+        for (b_col = 0; b_col < col_block_num; b_col++) {
+            int col_start = b_col * DYNAMIC_BLOCK_SIZE;
+            int col_end = min((b_col + 1) * DYNAMIC_BLOCK_SIZE, n);
+            for (col = col_start; col < col_end; col++) {
+                // 选主元（复用串行优化逻辑）
+                pivot_row = col;
+                max_val = fabsf(A[pivot_row * n + col]);
+                if (max_val < 1e-6) break;
+                
+                for (row = col+1; row < n; row++) {
+                    float curr_val = fabsf(A[row * n + col]);
+                    if (curr_val > max_val) {
+                        max_val = curr_val;
+                        pivot_row = row;
+                    }
+                }
+
+                // 按缓存行交换行
+                if (pivot_row != col) {
+                    for (int j = col; j < n; j += CACHE_LINE) {
+                        int end_j = min(j + CACHE_LINE, n);
+                        for (int k = j; k < end_j; k++) {
+                            temp = A[col * n + k];
+                            A[col * n + k] = A[pivot_row * n + k];
+                            A[pivot_row * n + k] = temp;
+                        }
+                    }
+                    temp = B[col];
+                    B[col] = B[pivot_row];
+                    B[pivot_row] = temp;
+                }
+
+                // 分块内消元
+                float pivot_val = A[col * n + col];
+                for (b_row = 0; b_row < row_block_num; b_row++) {
+                    int row_start = max(b_row * DYNAMIC_BLOCK_SIZE, col+1);
+                    int row_end = min((b_row + 1) * DYNAMIC_BLOCK_SIZE, n);
+                    for (row = row_start; row < row_end; row++) {
+                        factor = A[row * n + col] / pivot_val;
+                        A[row * n + col] = 0.0f;
+                        
+                        // 优化4：提前计算SIMD循环次数，减少边界判断
+                        int simd_end = (n - col) / (USE_AVX2 ? 8 : 4) * (USE_AVX2 ? 8 : 4) + col;
+                        int j = col+1;
+                        
+                        if (USE_AVX2) {
+                            // AVX2批量8元素
+                            for (; j < simd_end; j += 8) {
+                                __m256 V_pivot = _mm256_loadu_ps(&A[col * n + j]);
+                                __m256 V_row = _mm256_loadu_ps(&A[row * n + j]);
+                                __m256 V_factor = _mm256_set1_ps(factor);
+                                V_row = _mm256_sub_ps(V_row, _mm256_mul_ps(V_factor, V_pivot));
+                                _mm256_storeu_ps(&A[row * n + j], V_row);
+                            }
+                        } else {
+                            // SSE批量4元素
+                            for (; j < simd_end; j += 4) {
+                                __m128 V_pivot = _mm_loadu_ps(&A[col * n + j]);
+                                __m128 V_row = _mm_loadu_ps(&A[row * n + j]);
+                                __m128 V_factor = _mm_set1_ps(factor);
+                                V_row = _mm_sub_ps(V_row, _mm_mul_ps(V_factor, V_pivot));
+                                _mm_storeu_ps(&A[row * n + j], V_row);
+                            }
+                        }
+
+                        // 处理剩余元素
+                        for (; j < n; j++) {
+                            A[row * n + j] -= factor * A[col * n + j];
+                        }
+                        B[row] -= factor * B[col];
+                    }
+                }
+            }
+        }
+
+        // 回代求解（复用串行优化逻辑）
+        float* x = new float[n];
+        for (row = n-1; row >= 0; row--) {
+            float sum = 0.0f;
+            for (col = row+1; col < n; col += CACHE_LINE) {
+                int end_col = min(col + CACHE_LINE, n);
+                for (int k = col; k < end_col; k++) {
+                    sum += A[row * n + k] * x[k];
+                }
+            }
+            x[row] = (B[row] - sum) / A[row * n + row];
+        }
+        return x;
+    } catch (const exception& e) {
+        cerr << "SIMD优化版本异常：" << e.what() << endl;
+        return nullptr;
+    }
+}
+
+// ========== 批量测试（输出四组对比表格） ==========
+void batch_test() {
+    // CPU预热（避免首次运行Cache冷启动）
+    int warmup_n = 100;
+    float* A_warm = new float[warmup_n * warmup_n];
+    float* B_warm = new float[warmup_n];
+    generate_test_data(warmup_n, A_warm, B_warm);
+    gauss_serial_baseline(warmup_n, A_warm, B_warm);
+    delete[] A_warm;
+    delete[] B_warm;
+
+    cout << "===== 高斯消去算法性能对比测试 =====\n";
+    cout << "指令集：" << (USE_AVX2 ? "AVX2" : "SSE") << " | 基础分块：" << BLOCK_SIZE << "×" << BLOCK_SIZE 
+         << " | 动态分块：" << get_L1_cache_size() << "×" << get_L1_cache_size() << "\n";
+    cout << "--------------------------------------------------------------------------\n";
+    cout << "规模\t串行基准(s)\t串行优化(s)\tSIMD基准(s)\tSIMD优化(s)\t最优加速比\n";
+    cout << "--------------------------------------------------------------------------\n";
+
+    for (int i = 0; i < TEST_COUNT; i++) {
+        int n = TEST_SIZES[i];
+        // 跳过超大矩阵避免内存不足（4000阶矩阵≈64MB，可根据内存调整）
+        if (n * n * sizeof(float) > 1024 * 1024 * 200) { // 超过200MB
+            printf("%d\t-\t\t-\t\t-\t\t-\t\t-\n", n);
+            continue;
+        }
+
+        // 分配四组独立内存，避免数据污染
+        float* A1 = new (nothrow) float[n * n]; float* B1 = new (nothrow) float[n];
+        float* A2 = new (nothrow) float[n * n]; float* B2 = new (nothrow) float[n];
+        float* A3 = new (nothrow) float[n * n]; float* B3 = new (nothrow) float[n];
+        float* A4 = new (nothrow) float[n * n]; float* B4 = new (nothrow) float[n];
+
+        if (!A1 || !B1 || !A2 || !B2 || !A3 || !B3 || !A4 || !B4) {
+            printf("%d\t内存不足\t内存不足\t内存不足\t内存不足\t-\n", n);
+            delete[] A1; delete[] B1; delete[] A2; delete[] B2;
+            delete[] A3; delete[] B3; delete[] A4; delete[] B4;
+            continue;
+        }
+
+        // 生成相同测试数据
+        generate_test_data(n, A1, B1);
+        memcpy(A2, A1, n * n * sizeof(float)); memcpy(B2, B1, n * sizeof(float));
+        memcpy(A3, A1, n * n * sizeof(float)); memcpy(B3, B1, n * sizeof(float));
+        memcpy(A4, A1, n * n * sizeof(float)); memcpy(B4, B1, n * sizeof(float));
+
+        // 测试1：串行基准
+        double start = get_high_res_time();
+        float* x1 = gauss_serial_baseline(n, A1, B1);
+        double t1 = get_high_res_time() - start;
+
+        // 测试2：串行优化
+        start = get_high_res_time();
+        float* x2 = gauss_serial_optimized(n, A2, B2);
+        double t2 = get_high_res_time() - start;
+
+        // 测试3：SIMD基准
+        start = get_high_res_time();
+        float* x3 = gauss_simd_baseline(n, A3, B3);
+        double t3 = get_high_res_time() - start;
+
+        // 测试4：SIMD优化
+        start = get_high_res_time();
+        float* x4 = gauss_simd_optimized(n, A4, B4);
+        double t4 = get_high_res_time() - start;
+
+        // 计算最优加速比（相对串行基准）
+        double best_speedup = (t4 > 1e-6) ? (t1 / t4) : 0.0;
+
+        // 格式化输出（保留4位小数）
+        printf("%d\t%.4f\t\t%.4f\t\t%.4f\t\t%.4f\t\t%.2f\n", 
+               n, t1, t2, t3, t4, best_speedup);
+
+        // 释放内存
+        delete[] A1; delete[] B1; delete[] x1;
+        delete[] A2; delete[] B2; delete[] x2;
+        delete[] A3; delete[] B3; delete[] x3;
+        delete[] A4; delete[] B4; delete[] x4;
+    }
+    cout << "--------------------------------------------------------------------------\n";
+}
+
+// ===================== 主函数 =====================
+int main() {
+    // 编译提示（适配Dev-C++）
+    cout << "编译配置：-std=c++11 -msse -mavx2 -O2 -fno-strict-aliasing\n\n";
+    // 批量测试不同规模
+    batch_test();
+
+    cout << "\n测试完成\n";
+    system("pause > nul");
+    return 0;
+}
